@@ -36,7 +36,19 @@ To find out more, please check out the Snowplow website and the docs website.
     <a href="https://expressjs.com" target="_blank"> <img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/express/express-original-wordmark.svg" alt="express" width="40" height="40"/> </a>
 </p>
 
-$ ./tree-md .
+
+# Team Members
+
+### John Smith - Dev
+### Ryan Williams - Dev
+### Chris Brown - QA Manual
+### Frank Jones - QA Automatic
+### Miguel Garcia - Team Lead
+### Dan Miller - Team Manager
+### David Harrys - Technical Writer
+### Nancy Roberts - Analyst
+### Karen Heisenhower - Consultant
+
 # Project tree ( Directories )
 
 .
