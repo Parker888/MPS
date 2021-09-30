@@ -1,0 +1,565 @@
+import http from 'http'
+import express from 'express'
+import bodyParser from 'body-parser'
+import { env } from 'decentraland-commons'
+
+import { db } from './database'
+import { AssetRouter, ParcelRouter, EstateRouter } from './Asset'
+import { MortgageRouter } from './Mortgage'
+import { DistrictRouter } from './District'
+import { ContributionRouter } from './Contribution'
+import { TileRouter } from './Tile'
+import { TranslationRouter } from './Translation'
+import { MapRouter } from './Map'
+import { MarketplaceRouter } from './Marketplace'
+import { InviteRouter } from './Invite'
+import { BidRouter, PublicationRouter } from './Listing'
+import { AuthorizationRouter } from './Authorization'
+import { BlockchainEventRouter } from './BlockchainEvent'
+import { ClaimedNameRouter } from './ClaimedName'
+
+import { Publication, PublicationQueries, ListingQueries } from '../Listing'
+import { Asset, EstateQueries } from '../Asset'
+import { ApprovalQueries } from '../Approval'
+import { db, SQL, raw } from '../database'
+
+import { expect } from 'chai'
+import { txUtils } from 'decentraland-eth'
+
+import { Marketplace } from './Marketplace'
+import { Parcel, ParcelService } from '../Asset'
+import { Publication } from '../Listing'
+import { db } from '../database'
+import { ASSET_TYPES } from '../shared/asset'
+import { LISTING_STATUS } from '../shared/listing'
+
+const SERVER_PORT = env.get('SERVER_PORT', 5000)
+const CORS_ORIGIN = env.get('CORS_ORIGIN', '*')
+const CORS_METHOD = env.get('CORS_METHOD', '*')
+
+const app = express()
+const httpServer = http.Server(app)
+
+app.use(bodyParser.urlencoded({ extended: false, limit: '2mb' }))
+app.use(bodyParser.json())
+app.use((_, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN)
+  res.setHeader('Access-Control-Request-Method', CORS_METHOD)
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'OPTIONS, GET, POST, PUT, DELETE'
+  )
+  res.setHeader('Access-Control-Expose-Headers', 'etag')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+  next()
+})
+
+if (!env.isDevelopment()) {
+  // This is not ideal, but adding newrelic to development is worse
+  require('newrelic')
+}
+
+// Set base URL for API to v1
+const router = new express.Router()
+app.use('/v1', router)
+
+/* Start the server only if run directly */
+if (require.main === module) {
+  startServer().catch(console.error)
+}
+
+export async function startServer() {
+  console.log('Connecting database')
+  await db.connect()
+
+  new AssetRouter(router).mount()
+  new EstateRouter(router).mount()
+  new MortgageRouter(router).mount()
+  new DistrictRouter(router).mount()
+  new ContributionRouter(router).mount()
+  new PublicationRouter(router).mount()
+  new TileRouter(router).mount()
+  new TranslationRouter(router).mount()
+  new MapRouter(router).mount()
+  new MarketplaceRouter(router).mount()
+  new ParcelRouter(router).mount()
+  new InviteRouter(router).mount()
+  new BidRouter(router).mount()
+  new AuthorizationRouter(router).mount()
+  new BlockchainEventRouter(router).mount()
+  new ClaimedNameRouter(router).mount()
+
+  return httpServer.listen(SERVER_PORT, () =>
+    console.log('Server running on port', SERVER_PORT)
+  )
+}
+
+import { server } from 'decentraland-server'
+import { createCanvas } from 'canvas'
+
+import { indexedTiles } from '../Tile'
+import { Parcel, Estate, EstateService } from '../Asset'
+import { MapReqQueryParams } from '../ReqQueryParams'
+import { sanitizeParcels } from '../sanitize'
+import { calculateMapProps } from '../shared/estate'
+import { Viewport } from '../shared/map'
+import { Map as MapRenderer } from '../shared/map/render'
+
+export class MapRouter {
+  constructor(app) {
+    this.app = app
+  }
+
+  mount() {
+    this.app.get('/map.png', this.handleRequest(this.getMapPNG))
+    this.app.get(
+      '/parcels/:x/:y/map.png',
+      this.handleRequest(this.getParcelPNG)
+    )
+    this.app.get('/estates/:id/map.png', this.handleRequest(this.getEstatePNG))
+
+    this.app.get('/map', server.handleRequest(this.getMap))
+  }
+
+  handleRequest(callback) {
+    return async (req, res) => {
+      try {
+        await callback.call(this, req, res)
+      } catch (error) {
+        res.status(500)
+        res.send(error.message)
+      }
+    }
+  }
+
+  async getMapPNG(req, res) {
+    return this.sendPNG(res, this.sanitize(req))
+  }
+
+  async getParcelPNG(req, res) {
+    const { x, y, ...mapOptions } = this.sanitize(req)
+    const center = { x, y }
+
+    mapOptions.center = center
+    mapOptions.selected = [center]
+
+    return this.sendPNG(res, mapOptions)
+  }
+
+  async getEstatePNG(req, res) {
+    const id = server.extractFromReq(req, 'id')
+    const estate = await Estate.findByTokenId(id)
+    if (!estate) {
+      throw new Error(`The estate with token id "${id}" doesn't exist.`)
+    }
+
+    const mapOptions = this.sanitize(req)
+    const { parcels } = estate.data
+    const { center, zoom, pan } = calculateMapProps(parcels, mapOptions.size)
+
+    mapOptions.selected = parcels
+    mapOptions.center = center
+    mapOptions.zoom = zoom
+    mapOptions.pan = pan
+
+    return this.sendPNG(res, mapOptions)
+  }
+
+  async getMap(req) {
+    let nw
+    let se
+    try {
+      nw = server.extractFromReq(req, 'nw')
+      se = server.extractFromReq(req, 'se')
+    } catch (_) {
+      throw new Error('Both "nw" and "se" are required query params')
+    }
+
+    const parcelsRange = await Parcel.inRange(nw, se)
+    const parcels = sanitizeParcels(parcelsRange)
+    const estates = await new EstateService().getByParcels(parcels)
+
+    const assets = { parcels, estates }
+    const total = parcels.length + estates.length
+    return { assets, total }
+  }
+
+  async sendPNG(
+    res,
+    { width, height, size, center, zoom, pan, selected, address, skipOnSale }
+  ) {
+    const { nw, se } = Viewport.getDimensions({
+      width,
+      height,
+      size,
+      center,
+      zoom,
+      pan,
+      padding: 1
+    })
+
+    try {
+      const stream = await this.getStream({
+        nw,
+        se,
+        width,
+        height,
+        size,
+        center,
+        selected,
+        address,
+        skipOnSale
+      })
+      res.type('png')
+      stream.pipe(res)
+    } catch (error) {
+      res.status(500)
+      res.send(error.message)
+    }
+  }
+
+  async getStream({
+    nw,
+    se,
+    width,
+    height,
+    size,
+    center,
+    selected,
+    address,
+    skipOnSale
+  }) {
+    const tiles = address
+      ? await indexedTiles.getForOwner(address)
+      : await indexedTiles.get()
+
+    const canvas = createCanvas(width, height)
+    const ctx = canvas.getContext('2d')
+
+    new MapRenderer(ctx, {
+      width,
+      height,
+      size
+    }).draw({
+      nw,
+      se,
+      center,
+      tiles,
+      selected,
+      skipOnSale
+    })
+    return canvas.pngStream()
+  }
+
+  sanitize(req) {
+    return new MapReqQueryParams(req).sanitize()
+  }
+}
+
+export class Marketplace {
+  async filterAll(filters) {
+    const { status, sort, pagination } = filters.sanitize()
+
+    const [publications, total] = await Promise.all([
+      db.query(
+        SQL`SELECT asset_id, asset_type
+          FROM ${raw(Publication.tableName)}
+          WHERE ${ListingQueries.hasStatus(status)}
+            AND ${PublicationQueries.isActive()}
+            AND ${EstateQueries.estateHasParcels(Publication.tableName)}
+          ORDER BY ${raw(sort.by)} ${raw(sort.order)}
+          LIMIT ${raw(pagination.limit)} OFFSET ${raw(pagination.offset)}`
+      ),
+      this.countAssetPublications(filters)
+    ])
+
+    const assets = await Promise.all(
+      publications.map(async publication => {
+        const Model = Asset.getNew(publication.asset_type)
+        const asset = await Model.findById(publication.asset_id)
+        asset.publication = publication
+        return asset
+      })
+    )
+
+    return { assets, total }
+  }
+
+  async filter(queryParams, PublicableAsset) {
+    const { status, asset_type, sort, pagination } = queryParams.sanitize()
+
+    const [assets, total] = await Promise.all([
+      db.query(
+        SQL`SELECT assets.*,
+            row_to_json(pub.*) as publication,
+            ${ApprovalQueries.selectAssetApprovals(asset_type)}
+          FROM ${raw(Publication.tableName)} as pub
+          JOIN ${raw(
+            PublicableAsset.tableName
+          )} as assets ON assets.id = pub.asset_id
+          WHERE ${PublicationQueries.hasAssetType(asset_type)}
+            AND ${ListingQueries.hasStatus(status)}
+            AND ${PublicationQueries.isActive()}
+            AND ${EstateQueries.estateHasParcels('pub')}
+          ORDER BY pub.${raw(sort.by)} ${raw(sort.order)}
+          LIMIT ${raw(pagination.limit)} OFFSET ${raw(pagination.offset)}`
+      ),
+      this.countAssetPublications(queryParams)
+    ])
+
+    return { assets, total }
+  }
+
+  async countAssetPublications(queryParams) {
+    const { status, asset_type } = queryParams.sanitize()
+
+    const result = await db.query(
+      SQL`SELECT COUNT(*)
+        FROM ${raw(Publication.tableName)} as pub
+        WHERE pub.status = ${status}
+          AND ${PublicationQueries.hasAssetType(asset_type)}
+          AND ${PublicationQueries.isActive()}
+          AND ${EstateQueries.estateHasParcels('pub')}`
+    )
+
+    return parseInt(result[0].count, 10)
+  }
+}
+
+describe('Marketplace', function() {
+  const queryParams = {
+    sanitize() {
+      return {
+        status: LISTING_STATUS.open,
+        asset_type: ASSET_TYPES.parcel,
+        sort: {
+          by: 'price',
+          order: 'desc'
+        },
+        pagination: {
+          limit: 1,
+          offset: 1
+        }
+      }
+    }
+  }
+
+  describe('#filter', function() {
+    it('should filter the published assets using the supplied queryParams', async function() {
+      // Setup
+      const owner = '0xasdf'
+      const tx_status = txUtils.TRANSACTION_TYPES.confirmed
+      const status = LISTING_STATUS.open
+      const block_number = 1
+      const block_time_created_at = null
+      const block_time_updated_at = null
+      const marketplace_address = '0xdeadbeef'
+
+      let expires_at = new Date()
+      expires_at.setMonth(expires_at.getMonth() + 3)
+      expires_at = expires_at.getTime()
+
+      const soldPublication = {
+        tx_hash: '0x1',
+        contract_id: '0x1',
+        asset_id: '0,0',
+        price: 3,
+        status: LISTING_STATUS.sold,
+        expires_at,
+        owner,
+        tx_status,
+        block_time_created_at,
+        block_time_updated_at,
+        marketplace_address,
+        block_number
+      }
+      const publicationRows = [
+        soldPublication,
+        {
+          tx_hash: '0x2',
+          contract_id: '0x2',
+          asset_id: '1,0',
+          price: 20,
+          expires_at,
+          owner,
+          tx_status,
+          status,
+          block_time_created_at,
+          block_time_updated_at,
+          marketplace_address,
+          block_number
+        },
+        {
+          tx_hash: '0x3',
+          contract_id: '0x3',
+          asset_id: '1,1',
+          price: 50,
+          expires_at,
+          owner,
+          tx_status,
+          status,
+          block_time_created_at,
+          block_time_updated_at,
+          marketplace_address,
+          block_number
+        },
+        {
+          tx_hash: '0x4',
+          contract_id: '0x4',
+          asset_id: '1,2',
+          price: 40,
+          expires_at,
+          owner,
+          tx_status,
+          status,
+          block_time_created_at,
+          block_time_updated_at,
+          marketplace_address,
+          block_number
+        }
+      ]
+
+      // Inserts
+      const inserts = publicationRows.map(publication =>
+        Publication.insert(publication)
+      )
+      inserts.push(new ParcelService().insertMatrix(0, 0, 3, 3))
+      await Promise.all(inserts)
+
+      // Filter
+      const { assets, total } = await new Marketplace().filter(
+        queryParams,
+        Parcel
+      )
+
+      expect(assets).to.equalRows([
+        {
+          x: 1,
+          y: 2,
+          token_id: null,
+          update_operator: null,
+          auction_price: null,
+          auction_owner: null,
+          auction_timestamp: null,
+          district_id: null,
+          last_transferred_at: null,
+          owner: null,
+          data: null,
+          tags: {},
+          estate_id: null,
+          operator: null,
+          approvals_for_all: [],
+          update_managers: [],
+          publication: {
+            tx_hash: '0x4',
+            contract_id: '0x4',
+            price: 40,
+            buyer: null,
+            status: LISTING_STATUS.open,
+            asset_type: ASSET_TYPES.parcel,
+            asset_id: '1,2',
+            expires_at,
+            owner,
+            tx_status,
+            block_time_created_at,
+            block_time_updated_at,
+            marketplace_address,
+            block_number
+          }
+        }
+      ])
+      expect(total).to.be.equal(3)
+    })
+  })
+
+  afterEach(() =>
+    [Parcel, Publication].map(Model => db.truncate(Model.tableName)))
+})
+
+import { ListingQueries } from './Listing.queries'
+import { SQL, raw, db } from '../database'
+import { Asset } from '../Asset'
+import { LISTING_STATUS, LISTING_ASSET_TYPES } from '../shared/listing'
+
+export class Listing {
+  constructor(Model) {
+    this.Model = Model
+    this.tableName = Model.tableName
+  }
+
+  static isValidStatus(status) {
+    return Object.values(LISTING_STATUS).includes(status)
+  }
+
+  static isValidAssetType(assetType) {
+    return Object.values(LISTING_ASSET_TYPES).includes(assetType)
+  }
+
+  static getListableAsset(assetType) {
+    if (!Listing.isValidAssetType(assetType)) {
+      throw new Error(`Invalid publication asset_type "${assetType}"`)
+    }
+
+    return Asset.getModel(assetType)
+  }
+
+  static getListableAssets() {
+    const listableAsset = {}
+
+    for (const key in LISTING_ASSET_TYPES) {
+      listableAsset[key] = Asset.getModel(key)
+    }
+
+    return Object.values(listableAsset)
+  }
+
+  static filterAssetsByModelAssets(assets) {
+    const Assets = Listing.getListableAssets()
+    return assets.map(asset => {
+      for (const Model of Assets) {
+        if (asset[Model.tableName] != null) {
+          Object.assign(asset, asset[Model.tableName])
+        }
+        delete asset[Model.tableName]
+      }
+      return asset
+    })
+  }
+
+  async findByOwner(owner) {
+    return this.Model.find({ owner })
+  }
+
+  async updateExpired() {
+    return db.query(SQL`
+      UPDATE ${raw(this.tableName)}
+        SET updated_at = NOW(),
+            status = ${LISTING_STATUS.expired}
+      WHERE ${ListingQueries.isInactive()}
+        AND ${ListingQueries.hasStatuses([
+          LISTING_STATUS.open,
+          LISTING_STATUS.fingerprintChanged
+        ])}`)
+  }
+
+  async findByAssetId(asset_id, asset_type) {
+    return this.Model.find({ asset_id, asset_type }, { created_at: 'DESC' })
+  }
+
+  async findByAssetIdWithStatus(asset_id, asset_type, status) {
+    if (!Listing.isValidStatus(status)) {
+      throw new Error(`Invalid status "${status}"`)
+    }
+
+    return this.Model.find(
+      { asset_id, asset_type, status },
+      { created_at: 'DESC' }
+    )
+  }
+
+  // TODO: Add asset_type
+  async deleteByAssetId(asset_id) {
+    return this.Model.delete({ asset_id })
+  }
+}
